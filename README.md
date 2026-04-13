@@ -16,7 +16,7 @@
 
 - **AI 创建题库**：从知识库自动生成选择题、判断题
 - **Gradio 界面**：独立 Web 应用答题
-- **OCR 支持**：自动识别扫描版 PDF（PaddleOCR 优先，EasyOCR 备选）
+- **OCR 支持**：多引擎支持（MinerU > PaddleOCR > EasyOCR）
 - **PDF 预览**：快速预览 PDF 内容
 - **智能缓存**：Laravel 风格缓存管理，避免重复 OCR 处理
 
@@ -83,8 +83,9 @@ cache.flush()
 
 | 引擎 | 优先级 | 说明 |
 |------|--------|------|
-| PaddleOCR | 高 | 高精度中英文识别 |
-| EasyOCR | 中 | 多语言支持 |
+| MinerU | 高 | OpenDataLab 高精度文档解析，支持公式/表格/109语言 |
+| PaddleOCR | 中 | 高精度中英文识别 |
+| EasyOCR | 低 | 多语言支持 |
 
 ## 数据存储
 
@@ -104,6 +105,7 @@ cache.flush()
 
 ## 致谢
 
+- [MinerU](https://github.com/opendatalab/MinerU) - 高精度文档解析
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - OCR 识别
 - [PaddlePaddle](https://github.com/PaddlePaddle/PaddlePaddle) - 深度学习框架
 - [EasyOCR](https://github.com/JaidedAI/EasyOCR) - 多语言 OCR

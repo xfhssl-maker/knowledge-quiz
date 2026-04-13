@@ -1,8 +1,13 @@
 """
 PDF OCR 模块
-支持多种 OCR 引擎：PaddleOCR (优先)、EasyOCR (备选)
+支持多种 OCR 引擎：MinerU API (优先)、PaddleOCR、EasyOCR
 自动检测并选择可用的引擎
 支持 PDF 预览和模型缓存
+
+OCR 引擎优先级：
+1. MinerU API - 高精度文档解析，支持公式/表格/多语言，输出 Markdown/JSON
+2. PaddleOCR - 高精度中英文 OCR
+3. EasyOCR - 多语言支持
 """
 
 import json
@@ -11,9 +16,56 @@ import sys
 import os
 import hashlib
 import pickle
+import time
+import requests
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timedelta
+
+# ============ 配置管理 ============
+
+# API Token 存储路径（用户数据目录，不会上传到 git）
+CONFIG_DIR = Path.home() / ".knowledge-quiz"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+def get_mineru_token() -> Optional[str]:
+    """获取 MinerU API Token"""
+    # 1. 先检查环境变量
+    token = os.environ.get("MINERU_API_TOKEN")
+    if token:
+        return token
+
+    # 2. 检查配置文件
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                return config.get("mineru_api_token")
+        except Exception:
+            pass
+
+    return None
+
+def set_mineru_token(token: str) -> bool:
+    """保存 MinerU API Token 到用户数据目录"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    config = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception:
+            pass
+
+    config["mineru_api_token"] = token
+
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 # ============ 缓存管理 (Laravel-style) ============
 
@@ -21,7 +73,7 @@ class CacheManager:
     """Laravel 风格的缓存管理器"""
 
     def __init__(self, cache_dir: Optional[Path] = None):
-        self.cache_dir = cache_dir or Path.home() / ".knowledge-quiz" / "cache"
+        self.cache_dir = cache_dir or CONFIG_DIR / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_cache_path(self, key: str) -> Path:
@@ -257,6 +309,14 @@ def check_easyocr_available() -> bool:
     except ImportError:
         return False
 
+def check_rapidocr_available() -> bool:
+    """检查 RapidOCR 是否可用"""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        return True
+    except ImportError:
+        return False
+
 def check_pymupdf_available() -> bool:
     """检查 PyMuPDF 是否可用"""
     try:
@@ -264,6 +324,10 @@ def check_pymupdf_available() -> bool:
         return True
     except ImportError:
         return False
+
+def check_mineru_api_available() -> bool:
+    """检查 MinerU API 是否可用（需要配置 Token）"""
+    return get_mineru_token() is not None
 
 def install_dependencies(engine: str = "auto") -> bool:
     """安装 OCR 依赖"""
@@ -286,9 +350,16 @@ def install_dependencies(engine: str = "auto") -> bool:
         return False
 
 def get_best_ocr_engine() -> Optional[str]:
-    """获取最佳可用的 OCR 引擎"""
+    """获取最佳可用的 OCR 引擎
+
+    优先级：MinerU API > PaddleOCR > RapidOCR > EasyOCR
+    """
+    if check_mineru_api_available():
+        return "mineru_api"
     if check_paddleocr_available():
         return "paddleocr"
+    if check_rapidocr_available():
+        return "rapidocr"
     if check_easyocr_available():
         return "easyocr"
     return None
@@ -319,7 +390,330 @@ def pdf_to_images(pdf_path: Path) -> List:
     doc.close()
     return images
 
-# ============ OCR 处理 (带缓存) ============
+# ============ MinerU API 处理 ============
+
+MINERU_API_URL = "https://mineru.net/api/v4/extract/task"
+MINERU_RESULT_URL = "https://mineru.net/api/v4/extract/task/{task_id}"
+
+def ocr_with_mineru_api_url(pdf_url: str, output_path: Optional[str] = None, model_version: str = "vlm") -> Tuple[str, dict]:
+    """使用 MinerU API 通过 URL 进行 PDF 解析
+
+    直接使用在线 URL 提交任务，适用于文件已上传到云存储的情况。
+
+    Args:
+        pdf_url: PDF 文件的在线 URL
+        output_path: 输出文件路径（可选）
+        model_version: 模型版本 (vlm/ocr)
+
+    Returns:
+        (markdown_text, metadata): 解析后的 Markdown 文本和元数据
+    """
+    token = get_mineru_token()
+    if not token:
+        raise ValueError("MinerU API Token 未配置。请运行: python ocr.py --set-token YOUR_TOKEN")
+
+    print(f"MinerU API 正在解析: {pdf_url}")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    # 提交解析任务
+    data = {
+        "url": pdf_url,
+        "model_version": model_version
+    }
+
+    response = requests.post(MINERU_API_URL, headers=headers, json=data)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"MinerU API 请求失败: {response.status_code} - {response.text}")
+
+    result = response.json()
+
+    if result.get("code") != 0:
+        raise RuntimeError(f"MinerU API 错误: {result.get('message', 'Unknown error')}")
+
+    task_id = result.get("data", {}).get("task_id")
+    if not task_id:
+        raise RuntimeError(f"未获取到任务 ID: {result}")
+
+    print(f"任务已提交，task_id: {task_id}")
+    print("等待处理完成...")
+
+    # 轮询任务状态
+    max_wait = 600  # 最大等待时间 10 分钟
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait:
+        status_url = MINERU_RESULT_URL.format(task_id=task_id)
+        status_response = requests.get(status_url, headers=headers)
+
+        if status_response.status_code != 200:
+            raise RuntimeError(f"查询任务状态失败: {status_response.text}")
+
+        status_data = status_response.json()
+        task_state = status_data.get("data", {}).get("state", "")
+
+        if task_state == "done":
+            break
+        elif task_state in ("failed", "error"):
+            err_msg = status_data.get("data", {}).get("err_msg", "Unknown error")
+            raise RuntimeError(f"任务处理失败: {err_msg}")
+
+        print(f"任务状态: {task_state or 'processing'}，等待中...")
+        time.sleep(5)
+
+    # 获取结果
+    result_data = status_data.get("data", {})
+
+    # 获取结果 ZIP 文件
+    zip_url = result_data.get("full_zip_url")
+
+    if not zip_url:
+        raise RuntimeError(f"未获取到结果文件 URL: {result_data}")
+
+    print(f"下载结果文件...")
+    zip_response = requests.get(zip_url)
+    if zip_response.status_code != 200:
+        raise RuntimeError(f"下载结果失败: {zip_response.status_code}")
+
+    # 解压 ZIP 获取 Markdown
+    import zipfile
+    import io
+
+    markdown_text = ""
+    with zipfile.ZipFile(io.BytesIO(zip_response.content)) as zf:
+        md_files = [f for f in zf.namelist() if f.endswith('.md')]
+        if md_files:
+            with zf.open(md_files[0]) as f:
+                markdown_text = f.read().decode('utf-8')
+        else:
+            raise RuntimeError(f"ZIP 中未找到 Markdown 文件: {zf.namelist()}")
+
+    # 构建元数据
+    metadata = {
+        "pdf_url": pdf_url,
+        "task_id": task_id,
+        "total_chars": len(markdown_text),
+        "ocr_engine": "mineru_api",
+        "model_version": model_version
+    }
+
+    # 保存到文件
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(markdown_text)
+        metadata["output_file"] = str(output_path)
+        print(f"结果已保存到: {output_path}")
+
+    print(f"MinerU API 解析完成，共 {len(markdown_text)} 字符")
+    return markdown_text, metadata
+
+def ocr_with_mineru_api(pdf_path: str, output_path: Optional[str] = None, model_version: str = "vlm") -> Tuple[str, dict]:
+    """使用 MinerU API 进行 PDF 解析
+
+    MinerU API 是 OpenDataLab 提供的高精度文档解析服务，支持：
+    - 公式、表格识别
+    - 多栏布局、跨页表格合并
+    - 109 种语言 OCR
+    - 输出 Markdown / JSON 格式
+
+    注意：MinerU 云端 API (mineru.net) 仅支持通过 URL 提交任务。
+    对于本地文件，本函数会：
+    1. 先尝试用 PyMuPDF 提取文本层
+    2. 如果有文本层，直接返回
+    3. 如果没有文本层（扫描版），回退到 PaddleOCR/EasyOCR
+
+    Args:
+        pdf_path: PDF 文件路径
+        output_path: 输出文件路径（可选）
+        model_version: 模型版本 (vlm/ocr)
+
+    Returns:
+        (markdown_text, metadata): 解析后的 Markdown 文本和元数据
+    """
+    token = get_mineru_token()
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
+
+    # 检查缓存
+    cache_key = f"mineru_api_{pdf_path}_{pdf_path.stat().st_size}"
+    cached = cache.get(cache_key)
+    if cached:
+        print("使用缓存的 OCR 结果...")
+        return cached.get('text', ''), cached.get('metadata', {})
+
+    print(f"处理本地 PDF: {pdf_path}")
+    file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+    print(f"文件大小: {file_size_mb:.2f} MB")
+
+    # MinerU 云端 API 不支持直接上传本地文件
+    # 策略：先检查 PDF 是否有可提取的文本层
+    if check_pymupdf_available():
+        print("检查 PDF 文本层...")
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            total_text = ""
+            page_count = doc.page_count
+
+            for i in range(page_count):
+                page = doc[i]
+                text = page.get_text()
+                total_text += text
+
+            doc.close()
+
+            # 如果有足够的文本内容，直接使用文本层
+            if len(total_text.strip()) > 100:
+                print(f"检测到文本层 ({len(total_text)} 字符)，直接提取...")
+                full_text = format_pdf_text(str(pdf_path))
+
+                metadata = {
+                    "pdf_path": str(pdf_path),
+                    "total_pages": page_count,
+                    "total_chars": len(full_text),
+                    "ocr_engine": "pymupdf_text_layer",
+                    "source": "text_layer"
+                }
+
+                # 保存到文件
+                if output_path:
+                    output_path = Path(output_path)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(full_text)
+                    metadata["output_file"] = str(output_path)
+                    print(f"结果已保存到: {output_path}")
+
+                # 缓存结果
+                cache.put(cache_key, {"text": full_text, "metadata": metadata}, ttl=7*86400)
+
+                print(f"文本提取完成，共 {len(full_text)} 字符")
+                return full_text, metadata
+            else:
+                print("未检测到文本层（扫描版 PDF），将使用本地 OCR 引擎...")
+
+        except Exception as e:
+            print(f"文本层提取失败: {e}")
+
+    # 没有文本层或提取失败，使用本地 OCR
+    # 选择最佳可用的本地 OCR 引擎
+    local_engine = None
+    if check_paddleocr_available():
+        local_engine = "paddleocr"
+    elif check_rapidocr_available():
+        local_engine = "rapidocr"
+    elif check_easyocr_available():
+        local_engine = "easyocr"
+    else:
+        print("未检测到本地 OCR 引擎，正在安装 RapidOCR...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "rapidocr_onnxruntime", "-q"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            local_engine = "rapidocr"
+        except:
+            raise RuntimeError(
+                f"无法处理此 PDF 文件。\n"
+                f"MinerU 云端 API 不支持直接上传本地文件。\n"
+                f"请安装本地 OCR 引擎：pip install rapidocr_onnxruntime 或 pip install paddleocr\n"
+                f"或者将 PDF 上传到云存储获取公开 URL，然后使用 ocr_with_mineru_api_url()"
+            )
+
+    # 使用本地 OCR 引擎处理
+    print(f"使用本地 OCR 引擎: {local_engine}")
+
+    if not check_pymupdf_available():
+        print("正在安装 PyMuPDF...")
+        install_dependencies("none")
+
+    # 转换 PDF 为图片
+    print("正在转换 PDF 页面...")
+    images = pdf_to_images(pdf_path)
+    print(f"共 {len(images)} 页")
+
+    # 执行 OCR (带缓存)
+    if local_engine == "paddleocr":
+        texts = ocr_with_paddleocr_cached(images, str(pdf_path))
+    elif local_engine == "rapidocr":
+        texts = ocr_with_rapidocr_cached(images, str(pdf_path))
+    else:
+        texts = ocr_with_easyocr_cached(images, str(pdf_path))
+
+    # 合并结果
+    full_text = "\n\n".join([f"=== 第{i+1}页 ===\n{text}" for i, text in enumerate(texts)])
+
+    # 保存到文件
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(full_text)
+        print(f"OCR 结果已保存到: {output_path}")
+
+    # 元数据
+    metadata = {
+        "pdf_path": str(pdf_path),
+        "total_pages": len(images),
+        "total_chars": len(full_text),
+        "ocr_engine": local_engine,
+        "source": "local_ocr",
+        "pages": [{"page": i+1, "chars": len(t)} for i, t in enumerate(texts)]
+    }
+
+    # 缓存结果
+    cache.put(cache_key, {"text": full_text, "metadata": metadata}, ttl=7*86400)
+
+    print(f"OCR 完成，共 {len(full_text)} 字符")
+    return full_text, metadata
+
+
+def format_pdf_text(pdf_path: str) -> str:
+    """格式化 PDF 文本层内容"""
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    all_text = []
+
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        text = page.get_text("text")
+
+        # 简单格式化
+        lines = text.split('\n')
+        formatted = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 检测可能的标题
+            if len(line) < 50 and not line.endswith('。') and not line.endswith('，'):
+                if line.startswith('第') and ('章' in line or '节' in line):
+                    formatted.append(f"\n## {line}\n")
+                elif line.startswith('考点'):
+                    formatted.append(f"\n### {line}\n")
+                else:
+                    formatted.append(line)
+            else:
+                formatted.append(line)
+
+        page_text = '\n'.join(formatted)
+        all_text.append(f"=== 第{page_num + 1}页 ===\n{page_text}")
+
+    doc.close()
+    return '\n\n'.join(all_text)
+
+# ============ 本地 OCR 处理 (带缓存) ============
 
 def ocr_with_paddleocr_cached(images: List, pdf_path: str) -> List[str]:
     """使用 PaddleOCR 进行文字识别 (带缓存)"""
@@ -379,67 +773,43 @@ def ocr_with_easyocr_cached(images: List, pdf_path: str) -> List[str]:
 
     return results
 
-def ocr_pdf(pdf_path: str, output_path: Optional[str] = None, use_cache: bool = True) -> Tuple[str, dict]:
-    """OCR 识别 PDF 文件"""
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
+def ocr_with_rapidocr_cached(images: List, pdf_path: str) -> List[str]:
+    """使用 RapidOCR 进行文字识别 (带缓存)
 
-    # 检查依赖
-    if not check_pymupdf_available():
-        print("正在安装 PyMuPDF...")
-        install_dependencies("none")
+    RapidOCR 是基于 ONNX Runtime 的轻量级 OCR，不需要 GPU 或深度学习框架。
+    """
+    cache_key = f"ocr_rapidocr_{pdf_path}_{len(images)}"
 
-    # 获取最佳 OCR 引擎
-    engine = get_best_ocr_engine()
+    # 尝试从缓存获取
+    cached_result = cache.get(cache_key)
+    if cached_result is not None:
+        print("使用缓存的 OCR 结果...")
+        return cached_result
 
-    if engine is None:
-        print("未检测到 OCR 引擎，正在安装 EasyOCR...")
-        if install_dependencies("easyocr"):
-            engine = "easyocr"
+    from rapidocr_onnxruntime import RapidOCR
+
+    # 初始化 OCR
+    ocr = RapidOCR()
+
+    results = []
+    for i, img in enumerate(images):
+        print(f"RapidOCR 处理第 {i+1}/{len(images)} 页...")
+
+        # RapidOCR 接受 numpy 数组或文件路径
+        result, elapse = ocr(img)
+
+        # 整理识别结果
+        # result 格式: [[box, text, confidence], ...]
+        if result:
+            page_text = "\n".join([item[1] for item in result])
         else:
-            raise RuntimeError("无法安装 OCR 引擎，请手动安装: pip install easyocr")
+            page_text = ""
+        results.append(page_text)
 
-    print(f"使用 OCR 引擎: {engine}")
+    # 缓存结果 (缓存7天)
+    cache.put(cache_key, results, ttl=7*86400)
 
-    # 转换 PDF 为图片
-    print("正在转换 PDF 页面...")
-    images = pdf_to_images(pdf_path)
-    print(f"共 {len(images)} 页")
-
-    # 执行 OCR (带缓存)
-    if use_cache:
-        if engine == "paddleocr":
-            texts = ocr_with_paddleocr_cached(images, str(pdf_path))
-        else:
-            texts = ocr_with_easyocr_cached(images, str(pdf_path))
-    else:
-        if engine == "paddleocr":
-            texts = ocr_with_paddleocr_cached.__wrapped__(images, str(pdf_path))
-        else:
-            texts = ocr_with_easyocr_cached.__wrapped__(images, str(pdf_path))
-
-    # 合并结果
-    full_text = "\n\n".join([f"=== 第{i+1}页 ===\n{text}" for i, text in enumerate(texts)])
-
-    # 保存到文件
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(full_text)
-        print(f"OCR 结果已保存到: {output_path}")
-
-    # 元数据
-    metadata = {
-        "pdf_path": str(pdf_path),
-        "total_pages": len(images),
-        "total_chars": len(full_text),
-        "ocr_engine": engine,
-        "pages": [{"page": i+1, "chars": len(t)} for i, t in enumerate(texts)]
-    }
-
-    return full_text, metadata
+    return results
 
 # ============ 知识点解析 ============
 
@@ -486,30 +856,136 @@ def parse_knowledge_from_ocr(text: str) -> List[dict]:
 
     return knowledge_points
 
+def ocr_pdf(pdf_path: str, output_path: Optional[str] = None, use_cache: bool = True, engine: Optional[str] = None) -> Tuple[str, dict]:
+    """OCR 识别 PDF 文件
+
+    Args:
+        pdf_path: PDF 文件路径
+        output_path: 输出文本文件路径（可选）
+        use_cache: 是否使用缓存
+        engine: 指定 OCR 引擎 (mineru_api/paddleocr/easyocr)，默认自动选择
+
+    Returns:
+        (text, metadata): 解析后的文本和元数据
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
+
+    # 如果未指定引擎，自动选择最佳引擎
+    if engine is None:
+        engine = get_best_ocr_engine()
+
+    if engine is None:
+        print("未检测到 OCR 引擎，正在安装 EasyOCR...")
+        if install_dependencies("easyocr"):
+            engine = "easyocr"
+        else:
+            raise RuntimeError("无法安装 OCR 引擎，请手动安装或配置 MinerU API Token")
+
+    print(f"使用 OCR 引擎: {engine}")
+
+    # MinerU API 使用独立的处理流程
+    if engine == "mineru_api":
+        full_text, metadata = ocr_with_mineru_api(str(pdf_path), output_path)
+        return full_text, metadata
+
+    # 其他引擎需要 PyMuPDF
+    if not check_pymupdf_available():
+        print("正在安装 PyMuPDF...")
+        install_dependencies("none")
+
+    # 转换 PDF 为图片
+    print("正在转换 PDF 页面...")
+    images = pdf_to_images(pdf_path)
+    print(f"共 {len(images)} 页")
+
+    # 执行 OCR (带缓存)
+    if engine == "paddleocr":
+        texts = ocr_with_paddleocr_cached(images, str(pdf_path))
+    elif engine == "rapidocr":
+        texts = ocr_with_rapidocr_cached(images, str(pdf_path))
+    else:
+        texts = ocr_with_easyocr_cached(images, str(pdf_path))
+
+    # 合并结果
+    full_text = "\n\n".join([f"=== 第{i+1}页 ===\n{text}" for i, text in enumerate(texts)])
+
+    # 保存到文件
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(full_text)
+        print(f"OCR 结果已保存到: {output_path}")
+
+    # 元数据
+    metadata = {
+        "pdf_path": str(pdf_path),
+        "total_pages": len(images),
+        "total_chars": len(full_text),
+        "ocr_engine": engine,
+        "pages": [{"page": i+1, "chars": len(t)} for i, t in enumerate(texts)]
+    }
+
+    return full_text, metadata
+
 # ============ 命令行入口 ============
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="PDF OCR 工具")
-    parser.add_argument("pdf_path", help="PDF 文件路径")
+    parser = argparse.ArgumentParser(description="PDF OCR 工具 - 支持 MinerU API/PaddleOCR/EasyOCR")
+    parser.add_argument("pdf_path", nargs="?", help="PDF 文件路径")
     parser.add_argument("-o", "--output", help="输出文本文件路径")
     parser.add_argument("--json", help="输出 JSON 元数据路径")
     parser.add_argument("--preview", action="store_true", help="预览 PDF 内容")
     parser.add_argument("--pages", type=int, default=3, help="预览页数")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
+    parser.add_argument("-e", "--engine", choices=["mineru_api", "paddleocr", "rapidocr", "easyocr", "auto"],
+                        default="auto", help="指定 OCR 引擎 (默认自动选择)")
+    parser.add_argument("--set-token", metavar="TOKEN", help="设置 MinerU API Token")
+    parser.add_argument("--show-token", action="store_true", help="显示当前配置的 MinerU API Token")
+    parser.add_argument("--clear-cache", action="store_true", help="清空所有缓存")
 
     args = parser.parse_args()
+
+    # 处理 Token 相关命令
+    if args.set_token:
+        if set_mineru_token(args.set_token):
+            print("MinerU API Token 已保存到:", CONFIG_FILE)
+        else:
+            print("保存 Token 失败")
+        exit(0)
+
+    if args.show_token:
+        token = get_mineru_token()
+        if token:
+            print(f"MinerU API Token: {token[:20]}...{token[-10:]}")
+        else:
+            print("未配置 MinerU API Token")
+        exit(0)
+
+    if args.clear_cache:
+        cache.flush()
+        print("缓存已清空")
+        exit(0)
+
+    # 需要 PDF 文件路径
+    if not args.pdf_path:
+        parser.print_help()
+        exit(1)
 
     if args.preview:
         # 预览模式
         print(view_pdf(args.pdf_path, args.pages))
     else:
         # OCR 模式
-        text, metadata = ocr_pdf(args.pdf_path, args.output, use_cache=not args.no_cache)
+        engine = None if args.engine == "auto" else args.engine
+        text, metadata = ocr_pdf(args.pdf_path, args.output, use_cache=not args.no_cache, engine=engine)
 
         print(f"\nOCR 完成！")
-        print(f"总页数: {metadata['total_pages']}")
+        print(f"总页数: {metadata.get('total_pages', 'N/A')}")
         print(f"总字符数: {metadata['total_chars']}")
         print(f"使用引擎: {metadata['ocr_engine']}")
 

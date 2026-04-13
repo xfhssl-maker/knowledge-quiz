@@ -2,7 +2,7 @@
 """
 Knowledge Quiz Gradio 应用
 固定界面，内容从知识库 JSON 文件加载
-支持错题集、知识点分类查看
+支持错题集、知识点分类查看（卡片式显示）、智能题目生成
 """
 
 import os
@@ -14,12 +14,18 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
+# ============ 数据目录 ============
+# 优先使用用户数据目录 ~/.knowledge-quiz/，如果不存在则使用脚本所在目录
+DATA_DIR = Path.home() / ".knowledge-quiz"
+if not (DATA_DIR / "knowledge-base.json").exists():
+    DATA_DIR = Path(__file__).parent
+
 # ============ 数据加载 ============
 
 def load_knowledge_base():
     """加载知识库数据"""
-    kb_path = Path(__file__).parent / "knowledge-base.json"
-    q_path = Path(__file__).parent / "questions.json"
+    kb_path = DATA_DIR / "knowledge-base.json"
+    q_path = DATA_DIR / "questions.json"
 
     kb_data = {"knowledge_points": [], "sections": [], "topics": []}
     questions = []
@@ -40,7 +46,7 @@ def load_knowledge_base():
 
 def load_answers():
     """加载答题记录"""
-    answers_path = Path(__file__).parent / "answers.json"
+    answers_path = DATA_DIR / "answers.json"
     if answers_path.exists():
         with open(answers_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -50,7 +56,7 @@ def load_answers():
 
 def save_answers(answers):
     """保存答题记录"""
-    answers_path = Path(__file__).parent / "answers.json"
+    answers_path = DATA_DIR / "answers.json"
     with open(answers_path, 'w', encoding='utf-8') as f:
         json.dump(answers, f, ensure_ascii=False, indent=2)
 
@@ -61,6 +67,228 @@ ANSWERS = load_answers()
 # 构建知识点索引
 KP_INDEX = {kp['id']: kp for kp in KB_DATA.get('knowledge_points', [])}
 
+# 按章节和考点分组的知识点
+KP_BY_SECTION = defaultdict(list)
+for kp in KB_DATA.get('knowledge_points', []):
+    section = kp.get('section', '未知')
+    KP_BY_SECTION[section].append(kp)
+
+# ============ 样式定义 ============
+
+CARD_STYLE = """
+<style>
+    .kp-container {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        max-width: 100%;
+    }
+
+    .section-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px 25px;
+        border-radius: 16px;
+        margin-bottom: 25px;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+    }
+
+    .section-header h2 {
+        margin: 0 0 8px 0;
+        font-size: 24px;
+        font-weight: 600;
+    }
+
+    .section-header .stats {
+        font-size: 14px;
+        opacity: 0.9;
+    }
+
+    .topic-group {
+        margin-bottom: 30px;
+    }
+
+    .topic-header {
+        background: linear-gradient(90deg, #f8fafc 0%, #e2e8f0 100%);
+        border-left: 4px solid #3b82f6;
+        padding: 12px 18px;
+        margin-bottom: 15px;
+        border-radius: 0 8px 8px 0;
+        font-weight: 600;
+        color: #1e40af;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .topic-header .count {
+        background: #3b82f6;
+        color: white;
+        padding: 2px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 500;
+    }
+
+    .kp-card {
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 15px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+        transition: all 0.3s ease;
+    }
+
+    .kp-card:hover {
+        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+        transform: translateY(-2px);
+        border-color: #c7d2fe;
+    }
+
+    .kp-card .kp-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: #1f2937;
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #f3f4f6;
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+    }
+
+    .kp-card .kp-number {
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        color: white;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 13px;
+        font-weight: 600;
+        flex-shrink: 0;
+    }
+
+    .kp-card .kp-content {
+        color: #374151;
+        line-height: 1.7;
+        font-size: 14px;
+        padding: 12px 15px;
+        background: #f9fafb;
+        border-radius: 8px;
+        margin-bottom: 12px;
+    }
+
+    .kp-card .kp-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-size: 12px;
+    }
+
+    .kp-card .kp-keyword {
+        background: #ede9fe;
+        color: #6d28d9;
+        padding: 4px 10px;
+        border-radius: 15px;
+        font-weight: 500;
+    }
+
+    .kp-card .kp-wrong {
+        background: #fef2f2;
+        color: #dc2626;
+        padding: 4px 10px;
+        border-radius: 15px;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+
+    .kp-card .kp-difficulty {
+        display: flex;
+        gap: 3px;
+    }
+
+    .kp-card .kp-difficulty .star {
+        color: #fbbf24;
+        font-size: 14px;
+    }
+
+    .kp-card .kp-difficulty .star.empty {
+        color: #d1d5db;
+    }
+
+    .overview-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin: 20px 0;
+    }
+
+    .overview-card {
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+        transition: all 0.3s ease;
+        cursor: default;
+    }
+
+    .overview-card:hover {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        transform: translateY(-2px);
+    }
+
+    .overview-card .icon {
+        font-size: 32px;
+        margin-bottom: 10px;
+    }
+
+    .overview-card .name {
+        font-weight: 600;
+        color: #1f2937;
+        margin-bottom: 5px;
+    }
+
+    .overview-card .count {
+        color: #6b7280;
+        font-size: 14px;
+    }
+
+    .total-stats {
+        background: linear-gradient(135deg, #0ea5e9 0%, #06b6d4 100%);
+        color: white;
+        border-radius: 16px;
+        padding: 25px;
+        margin-bottom: 20px;
+        display: flex;
+        justify-content: space-around;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 20px;
+    }
+
+    .total-stats .stat-item {
+        text-align: center;
+    }
+
+    .total-stats .stat-value {
+        font-size: 28px;
+        font-weight: 700;
+    }
+
+    .total-stats .stat-label {
+        font-size: 13px;
+        opacity: 0.9;
+        margin-top: 5px;
+    }
+</style>
+"""
+
 # ============ 错题管理 ============
 
 def get_wrong_questions():
@@ -69,25 +297,16 @@ def get_wrong_questions():
     wrong_questions = [q for q in ALL_QUESTIONS if q['id'] in wrong_ids]
     return wrong_questions
 
-def get_wrong_questions_by_section():
-    """按章节分组获取错题"""
-    wrong_questions = get_wrong_questions()
-    by_section = defaultdict(list)
-    for q in wrong_questions:
-        by_section[q.get('section', '未知')].append(q)
-    return dict(by_section)
-
 def get_weak_knowledge_points():
-    """获取薄弱知识点（关联错题）"""
+    """获取薄弱知识点"""
     wrong_questions = get_wrong_questions()
-    weak_kps = defaultdict(list)  # kp_id -> [wrong_questions]
+    weak_kps = defaultdict(list)
 
     for q in wrong_questions:
         kp_id = q.get('knowledge_point_id')
         if kp_id:
             weak_kps[kp_id].append(q)
 
-    # 按错误次数排序
     sorted_kps = sorted(weak_kps.items(), key=lambda x: -len(x[1]))
 
     result = []
@@ -109,7 +328,7 @@ class QuizSession:
         self.questions = []
         self.index = 0
         self.session_answers = {}
-        self.mode = "normal"  # normal, wrong_review
+        self.mode = "normal"
 
     def start(self, questions, mode="normal"):
         self.questions = questions
@@ -155,7 +374,7 @@ class QuizSession:
 
 session = QuizSession()
 
-# ============ Gradio 界面 ============
+# ============ Gradio 界面函数 ============
 
 def get_filtered_questions(q_type, section, count):
     """获取筛选后的题目"""
@@ -168,7 +387,6 @@ def get_filtered_questions(q_type, section, count):
     if section != "全部":
         filtered = [q for q in filtered if q.get('section') == section]
 
-    # 智能选题：优先未答过的
     unanswered = [q for q in filtered if q['id'] not in ANSWERS]
     answered = [q for q in filtered if q['id'] in ANSWERS]
     filtered = unanswered + answered
@@ -210,20 +428,13 @@ def render_question():
     answered, correct = session.stats()
     total = len(session.questions)
 
-    # 模式标识
     mode_tag = "🔄 错题复习" if session.mode == "wrong_review" else "📝 答题"
-
-    # 题目信息
     info = f"### {mode_tag} - 第 {session.index + 1} / {total} 题\n**章节**: {q.get('section', '')} | **考点**: {q.get('topic', '')}"
-
-    # 题目文本
     question_text = f"**{q['question']}**"
 
-    # 获取已答题的答案
     saved = ANSWERS.get(q['id'])
-
-    # 结果显示
     result_html = ""
+
     if saved:
         is_correct = saved.get('correct', False)
         if is_correct:
@@ -231,7 +442,6 @@ def render_question():
         else:
             result_html = f"<div style='padding: 15px; background: #fee2e2; border-radius: 8px; margin-top: 15px;'><b>✗ 回答错误</b><br>正确答案: {q['answer']}<br>{q.get('explanation', '')}</div>"
 
-        # 显示知识点
         kp_id = q.get('knowledge_point_id')
         if kp_id:
             kp = KP_INDEX.get(kp_id)
@@ -241,98 +451,156 @@ def render_question():
     return info, question_text, gr.update(visible=True), gr.update(visible=True), result_html, gr.update()
 
 def select_choice(choice):
-    """选择答案"""
     session.answer(choice)
     return render_question()
 
 def select_judgment(answer):
-    """判断题选择"""
     session.answer(answer)
     return render_question()
 
 def next_question():
-    """下一题"""
     session.next()
     return render_question()
 
 def prev_question():
-    """上一题"""
     session.prev()
     return render_question()
 
-# ============ 知识点分类查看 ============
+# ============ 知识点分类查看（卡片式显示） ============
 
-def get_knowledge_points_grouped(section_filter, topic_filter, keyword):
-    """获取分类后的知识点列表"""
-    points = KB_DATA.get('knowledge_points', [])
+def display_section_knowledge_points(section_name):
+    """显示单个章节的所有知识点（卡片式）"""
+    kps = KP_BY_SECTION.get(section_name, [])
 
-    # 过滤
-    if section_filter != "全部":
-        points = [p for p in points if p.get('section') == section_filter]
+    if not kps:
+        return f"{CARD_STYLE}<div class='kp-container'><p>章节 {section_name} 暂无知识点</p></div>"
 
-    if topic_filter != "全部":
-        points = [p for p in points if p.get('topic') == topic_filter]
+    # 按考点分组
+    by_topic = defaultdict(list)
+    for kp in kps:
+        topic = kp.get('topic', '其他') or '其他'
+        by_topic[topic].append(kp)
 
-    if keyword:
-        keyword = keyword.lower()
-        points = [p for p in points if
-                  keyword in p.get('title', '').lower() or
-                  keyword in p.get('content', '').lower() or
-                  any(keyword in k.lower() for k in p.get('keywords', []))]
+    result = CARD_STYLE
+    result += "<div class='kp-container'>"
 
-    # 按章节+考点分组
-    grouped = defaultdict(lambda: defaultdict(list))
-    for p in points:
-        section = p.get('section', '未知')
-        topic = p.get('topic', '其他') or '其他'
-        grouped[section][topic].append(p)
+    # 章节头部
+    result += f"""
+    <div class='section-header'>
+        <h2>📚 {section_name}</h2>
+        <div class='stats'>共 {len(kps)} 个知识点 · {len(by_topic)} 个考点</div>
+    </div>
+    """
 
-    # 格式化输出
-    result = f"**共 {len(points)} 个知识点**\n\n"
+    for topic, topic_kps in sorted(by_topic.items()):
+        result += f"""
+        <div class='topic-group'>
+            <div class='topic-header'>
+                📌 {topic}
+                <span class='count'>{len(topic_kps)} 个</span>
+            </div>
+        """
 
-    for section in KB_DATA.get('sections', []):
-        if section not in grouped:
-            continue
+        for i, kp in enumerate(topic_kps, 1):
+            title = kp.get('title', '无标题')
+            content = kp.get('content', '')
+            keywords = kp.get('keywords', [])
+            difficulty = kp.get('difficulty', 2)
 
-        section_points = sum(len(p) for p in grouped[section].values())
-        result += f"\n## 📚 {section} ({section_points} 个)\n\n"
+            # 难度星星
+            stars = ""
+            for j in range(5):
+                if j < difficulty:
+                    stars += '<span class="star">★</span>'
+                else:
+                    stars += '<span class="star empty">☆</span>'
 
-        for topic, topic_points in grouped[section].items():
-            result += f"### 📌 {topic} ({len(topic_points)} 个)\n\n"
+            # 关键词标签
+            keyword_tags = ""
+            if keywords:
+                for kw in keywords[:4]:
+                    keyword_tags += f'<span class="kp-keyword">{kw}</span>'
 
-            for i, p in enumerate(topic_points):
-                # 知识点卡片
-                result += f"**{i+1}. {p.get('title', '无标题')}**\n\n"
-                result += f"> {p.get('content', '')}\n\n"
+            # 错题数量
+            kp_id = kp['id']
+            wrong_count = sum(1 for qid, ans in ANSWERS.items()
+                              if not ans.get('correct') and
+                              next((q for q in ALL_QUESTIONS if q['id'] == qid and q.get('knowledge_point_id') == kp_id), None))
 
-                if p.get('keywords'):
-                    result += f"*关键词: {', '.join(p['keywords'])}*\n\n"
+            wrong_tag = ""
+            if wrong_count > 0:
+                wrong_tag = f'<span class="kp-wrong">⚠️ 错题 {wrong_count} 道</span>'
 
-                # 显示关联的错题数量
-                kp_id = p['id']
-                wrong_count = sum(1 for qid, ans in ANSWERS.items()
-                                  if not ans.get('correct') and
-                                  next((q for q in ALL_QUESTIONS if q['id'] == qid and q.get('knowledge_point_id') == kp_id), None))
-                if wrong_count > 0:
-                    result += f"⚠️ **错题: {wrong_count} 道**\n\n"
+            result += f"""
+            <div class='kp-card'>
+                <div class='kp-title'>
+                    <span class='kp-number'>{i}</span>
+                    <span>{title}</span>
+                </div>
+                <div class='kp-content'>{content}</div>
+                <div class='kp-meta'>
+                    <div class='kp-difficulty' title='难度'>{stars}</div>
+                    {keyword_tags}
+                    {wrong_tag}
+                </div>
+            </div>
+            """
 
-                result += "---\n\n"
+        result += "</div>"
 
-    return result or "未找到匹配的知识点"
+    result += "</div>"
+    return result
 
-def get_topics_for_section(section):
-    """获取指定章节的考点列表"""
-    points = KB_DATA.get('knowledge_points', [])
-    if section != "全部":
-        points = [p for p in points if p.get('section') == section]
+def get_all_sections_display():
+    """获取所有章节列表（卡片式）"""
+    sections = KB_DATA.get('sections', [])
+    total_kps = len(KB_DATA.get('knowledge_points', []))
 
-    topics = sorted(set(p.get('topic', '') for p in points if p.get('topic')))
-    return ["全部"] + topics
+    result = CARD_STYLE
+    result += "<div class='kp-container'>"
 
-def update_topic_dropdown(section):
-    """更新考点下拉框"""
-    topics = get_topics_for_section(section)
-    return gr.update(choices=topics, value="全部")
+    # 总体统计
+    result += f"""
+    <div class='total-stats'>
+        <div class='stat-item'>
+            <div class='stat-value'>{total_kps}</div>
+            <div class='stat-label'>知识点总数</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value'>{len(sections)}</div>
+            <div class='stat-label'>章节数量</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value'>{len(get_wrong_questions())}</div>
+            <div class='stat-label'>错题数量</div>
+        </div>
+    </div>
+    """
+
+    # 章节卡片
+    result += "<div class='overview-container'>"
+
+    section_icons = {
+        '解剖学': '🫀',
+        '生理学': '🧬',
+        '药理学': '💊',
+        '病理学': '🔬'
+    }
+
+    for section in sections:
+        count = len(KP_BY_SECTION.get(section, []))
+        icon = section_icons.get(section, '📖')
+
+        result += f"""
+        <div class='overview-card'>
+            <div class='icon'>{icon}</div>
+            <div class='name'>{section}</div>
+            <div class='count'>{count} 个知识点</div>
+        </div>
+        """
+
+    result += "</div></div>"
+    return result
 
 # ============ 错题集 ============
 
@@ -344,37 +612,58 @@ def get_wrong_questions_display(section):
         wrong_questions = [q for q in wrong_questions if q.get('section') == section]
 
     if not wrong_questions:
-        return "🎉 暂无错题，继续加油！"
+        return f"{CARD_STYLE}<div class='kp-container'><div class='section-header' style='background: linear-gradient(135deg, #10b981 0%, #059669 100%);'><h2>🎉 太棒了！</h2><div class='stats'>暂无错题，继续保持！</div></div></div>"
 
-    # 按章节分组
     by_section = defaultdict(list)
     for q in wrong_questions:
         by_section[q.get('section', '未知')].append(q)
 
-    result = f"## ❌ 错题集 (共 {len(wrong_questions)} 道)\n\n"
+    result = CARD_STYLE
+    result += "<div class='kp-container'>"
+    result += f"""
+    <div class='section-header' style='background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);'>
+        <h2>❌ 错题集</h2>
+        <div class='stats'>共 {len(wrong_questions)} 道错题</div>
+    </div>
+    """
 
     for section_name in KB_DATA.get('sections', []):
         if section_name not in by_section:
             continue
 
         section_wrong = by_section[section_name]
-        result += f"### 📚 {section_name} ({len(section_wrong)} 道)\n\n"
+
+        result += f"""
+        <div class='topic-group'>
+            <div class='topic-header' style='border-color: #ef4444; color: #dc2626;'>
+                📚 {section_name}
+                <span class='count' style='background: #ef4444;'>{len(section_wrong)} 道</span>
+            </div>
+        """
 
         for q in section_wrong:
-            result += f"**题目**: {q.get('question', '')[:80]}...\n\n"
-            result += f"- 类型: {'选择题' if q['type'] == 'choice' else '判断题'}\n"
-            result += f"- 正确答案: {q.get('answer', '')}\n"
-            result += f"- 考点: {q.get('topic', '')}\n\n"
+            q_type = '选择题' if q['type'] == 'choice' else '判断题'
+            q_text = q.get('question', '')[:100]
+            if len(q.get('question', '')) > 100:
+                q_text += '...'
 
-            # 关联知识点
-            kp_id = q.get('knowledge_point_id')
-            if kp_id and kp_id in KP_INDEX:
-                kp = KP_INDEX[kp_id]
-                result += f"📖 **知识点**: {kp.get('title', '')}\n"
-                result += f"> {kp.get('content', '')[:100]}...\n\n"
+            result += f"""
+            <div class='kp-card' style='border-left: 4px solid #ef4444;'>
+                <div class='kp-title' style='color: #dc2626;'>
+                    <span class='kp-number' style='background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);'>!</span>
+                    <span>{q_text}</span>
+                </div>
+                <div class='kp-meta'>
+                    <span class='kp-keyword' style='background: #fee2e2; color: #dc2626;'>{q_type}</span>
+                    <span class='kp-keyword' style='background: #d1fae5; color: #059669;'>正确答案: {q.get('answer', '')}</span>
+                    <span class='kp-keyword'>{q.get('topic', '')}</span>
+                </div>
+            </div>
+            """
 
-            result += "---\n\n"
+        result += "</div>"
 
+    result += "</div>"
     return result
 
 def get_weak_points_display():
@@ -382,25 +671,37 @@ def get_weak_points_display():
     weak_kps = get_weak_knowledge_points()
 
     if not weak_kps:
-        return "🎉 没有薄弱知识点，继续保持！"
+        return f"{CARD_STYLE}<div class='kp-container'><div class='section-header' style='background: linear-gradient(135deg, #10b981 0%, #059669 100%);'><h2>🎉 很好！</h2><div class='stats'>没有薄弱知识点</div></div></div>"
 
-    result = f"## 🎯 薄弱知识点分析\n\n"
-    result += f"以下知识点需要重点复习：\n\n"
+    result = CARD_STYLE
+    result += "<div class='kp-container'>"
+    result += f"""
+    <div class='section-header' style='background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);'>
+        <h2>🎯 薄弱知识点分析</h2>
+        <div class='stats'>以下知识点需要重点复习</div>
+    </div>
+    """
 
-    for item in weak_kps[:10]:  # 显示前10个最薄弱的
+    for item in weak_kps[:10]:
         kp = item['knowledge_point']
         wrong_count = item['wrong_count']
 
-        result += f"### ⚠️ {kp.get('title', '')} (错 {wrong_count} 次)\n\n"
-        result += f"> {kp.get('content', '')}\n\n"
-        result += f"- 章节: {kp.get('section', '')}\n"
-        result += f"- 考点: {kp.get('topic', '')}\n"
+        result += f"""
+        <div class='kp-card' style='border-left: 4px solid #f59e0b;'>
+            <div class='kp-title' style='color: #d97706;'>
+                <span class='kp-number' style='background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);'>{wrong_count}</span>
+                <span>{kp.get('title', '')}</span>
+            </div>
+            <div class='kp-content'>{kp.get('content', '')}</div>
+            <div class='kp-meta'>
+                <span class='kp-keyword'>{kp.get('section', '')}</span>
+                <span class='kp-keyword'>{kp.get('topic', '')}</span>
+                <span class='kp-wrong'>⚠️ 错 {wrong_count} 次</span>
+            </div>
+        </div>
+        """
 
-        if kp.get('keywords'):
-            result += f"- 关键词: {', '.join(kp['keywords'])}\n"
-
-        result += "\n---\n\n"
-
+    result += "</div>"
     return result
 
 # ============ 学习报告 ============
@@ -412,20 +713,43 @@ def get_report():
     correct = sum(1 for a in ANSWERS.values() if a.get('correct'))
     wrong = answered - correct
 
-    report = f"""## 📊 学习报告
+    result = CARD_STYLE
+    result += "<div class='kp-container'>"
 
-### 总体统计
-- **题目总数**: {total_q}
-- **已答题数**: {answered}
-- **正确题数**: {correct}
-- **错题数**: {wrong}
-- **正确率**: {correct/answered*100:.1f}% ({correct}/{answered})
+    # 总体统计
+    accuracy = correct/answered*100 if answered > 0 else 0
+    result += f"""
+    <div class='total-stats'>
+        <div class='stat-item'>
+            <div class='stat-value'>{total_q}</div>
+            <div class='stat-label'>题目总数</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value'>{answered}</div>
+            <div class='stat-label'>已答题数</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value' style='color: #86efac;'>{correct}</div>
+            <div class='stat-label'>正确题数</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value' style='color: #fca5a5;'>{wrong}</div>
+            <div class='stat-label'>错题数</div>
+        </div>
+        <div class='stat-item'>
+            <div class='stat-value'>{accuracy:.1f}%</div>
+            <div class='stat-label'>正确率</div>
+        </div>
+    </div>
+    """
 
-### 章节进度
-"""
-
-    # 按章节统计
+    # 章节进度
     sections = KB_DATA.get('sections', [])
+    result += """
+    <div class='topic-group'>
+        <div class='topic-header'>📊 章节进度</div>
+    """
+
     for sec in sections:
         sec_questions = [q for q in ALL_QUESTIONS if q.get('section') == sec]
         sec_answered = [q for q in sec_questions if q['id'] in ANSWERS]
@@ -435,27 +759,63 @@ def get_report():
         progress = len(sec_answered) / len(sec_questions) * 100 if sec_questions else 0
         accuracy = sec_correct / len(sec_answered) * 100 if sec_answered else 0
 
-        report += f"\n**{sec}**\n"
-        report += f"- 进度: {progress:.0f}% ({len(sec_answered)}/{len(sec_questions)})\n"
-        report += f"- 正确率: {accuracy:.0f}%\n"
-        report += f"- 错题: {sec_wrong} 道\n"
+        result += f"""
+        <div class='kp-card'>
+            <div class='kp-title'>
+                <span class='kp-number' style='background: linear-gradient(135deg, #0ea5e9 0%, #06b6d4 100%);'>{sec[0]}</span>
+                <span>{sec}</span>
+            </div>
+            <div class='kp-meta' style='gap: 15px;'>
+                <span>进度: <strong>{progress:.0f}%</strong> ({len(sec_answered)}/{len(sec_questions)})</span>
+                <span>正确率: <strong style='color: #059669;'>{accuracy:.0f}%</strong></span>
+                <span class='kp-wrong' style='display: {"inline-flex" if sec_wrong > 0 else "none"};'>错题 {sec_wrong} 道</span>
+            </div>
+        </div>
+        """
+
+    result += "</div>"
 
     # 薄弱知识点
     weak_kps = get_weak_knowledge_points()
     if weak_kps:
-        report += f"\n### 🎯 需要复习的知识点\n"
+        result += """
+        <div class='topic-group'>
+            <div class='topic-header' style='border-color: #f59e0b; color: #d97706;'>🎯 需要复习的知识点</div>
+        """
+
         for item in weak_kps[:5]:
             kp = item['knowledge_point']
-            report += f"- **{kp.get('title', '')}** (错 {item['wrong_count']} 次)\n"
+            result += f"""
+            <div class='kp-card' style='border-left: 4px solid #f59e0b;'>
+                <div class='kp-title' style='font-size: 14px;'>
+                    <span class='kp-wrong'>错 {item['wrong_count']} 次</span>
+                    {kp.get('title', '')}
+                </div>
+            </div>
+            """
 
-    return report
+        result += "</div>"
+
+    result += "</div>"
+    return result
 
 # ============ 创建 Gradio 应用 ============
 
 def create_app():
-    sections = ["全部"] + KB_DATA.get('sections', [])
+    sections = KB_DATA.get('sections', [])
 
-    with gr.Blocks(title="📚 Knowledge Quiz") as app:
+    with gr.Blocks(
+        title="📚 Knowledge Quiz",
+        theme=gr.themes.Soft(
+            primary_hue="indigo",
+            secondary_hue="purple",
+            neutral_hue="slate",
+        ),
+        css="""
+        .gradio-container { max-width: 1200px !important; }
+        .tab-nav button { font-size: 16px !important; padding: 12px 24px !important; }
+        """
+    ) as app:
         gr.Markdown("# 📚 医学基础必背考点")
 
         with gr.Tabs() as tabs:
@@ -463,31 +823,30 @@ def create_app():
             with gr.TabItem("🎯 开始答题", id=0):
                 with gr.Row():
                     q_type = gr.Dropdown(["全部", "选择题", "判断题"], value="全部", label="题型")
-                    section = gr.Dropdown(sections, value="全部", label="章节")
+                    section = gr.Dropdown(["全部"] + sections, value="全部", label="章节")
                     count = gr.Dropdown(["全部", "10题", "20题", "50题"], value="20题", label="题数")
 
-                start_btn = gr.Button("开始答题", variant="primary")
+                start_btn = gr.Button("开始答题", variant="primary", size="lg")
 
                 quiz_info = gr.Markdown("")
                 quiz_question = gr.Markdown("")
 
                 with gr.Row(visible=False) as choice_row:
-                    btn_a = gr.Button("A")
-                    btn_b = gr.Button("B")
-                    btn_c = gr.Button("C")
-                    btn_d = gr.Button("D")
+                    btn_a = gr.Button("A", size="lg")
+                    btn_b = gr.Button("B", size="lg")
+                    btn_c = gr.Button("C", size="lg")
+                    btn_d = gr.Button("D", size="lg")
 
                 with gr.Row(visible=False) as judgment_row:
-                    btn_true = gr.Button("✓ 正确")
-                    btn_false = gr.Button("✗ 错误")
+                    btn_true = gr.Button("✓ 正确", variant="primary", size="lg")
+                    btn_false = gr.Button("✗ 错误", variant="stop", size="lg")
 
                 quiz_result = gr.HTML("")
 
                 with gr.Row():
-                    prev_btn = gr.Button("⬅️ 上一题")
-                    next_btn = gr.Button("下一题 ➡️")
+                    prev_btn = gr.Button("⬅️ 上一题", size="lg")
+                    next_btn = gr.Button("下一题 ➡️", size="lg")
 
-                # 事件绑定
                 start_btn.click(start_quiz, [q_type, section, count], [quiz_info, quiz_question, choice_row, judgment_row, quiz_result, tabs])
 
                 btn_a.click(lambda: select_choice("A"), None, [quiz_info, quiz_question, choice_row, judgment_row, quiz_result, tabs])
@@ -504,55 +863,73 @@ def create_app():
             # ====== 错题集 Tab ======
             with gr.TabItem("❌ 错题集", id=1):
                 with gr.Row():
-                    wrong_section = gr.Dropdown(sections, value="全部", label="章节筛选")
+                    wrong_section = gr.Dropdown(["全部"] + sections, value="全部", label="章节筛选")
 
                 with gr.Row():
-                    refresh_wrong_btn = gr.Button("🔄 刷新错题")
-                    review_wrong_btn = gr.Button("📝 复习错题", variant="primary")
+                    refresh_wrong_btn = gr.Button("🔄 刷新错题", size="lg")
+                    review_wrong_btn = gr.Button("📝 复习错题", variant="primary", size="lg")
 
-                wrong_display = gr.Markdown("")
+                wrong_display = gr.HTML("")
 
                 refresh_wrong_btn.click(get_wrong_questions_display, [wrong_section], wrong_display)
                 review_wrong_btn.click(start_wrong_review, [wrong_section], [quiz_info, quiz_question, choice_row, judgment_row, quiz_result, tabs])
 
-                # 薄弱知识点
                 gr.Markdown("---")
-                weak_btn = gr.Button("🎯 查看薄弱知识点")
-                weak_display = gr.Markdown("")
+                weak_btn = gr.Button("🎯 查看薄弱知识点", variant="secondary", size="lg")
+                weak_display = gr.HTML("")
                 weak_btn.click(get_weak_points_display, None, weak_display)
 
-            # ====== 知识点学习 Tab ======
+            # ====== 知识点学习 Tab（卡片式显示） ======
             with gr.TabItem("📖 知识点学习", id=2):
+                gr.Markdown("## 📚 知识点分类查看")
+                gr.Markdown("点击下方按钮查看对应章节的所有知识点")
+
+                # 章节概览
+                overview_display = gr.HTML(get_all_sections_display())
+
+                gr.Markdown("---")
+
+                # 章节按钮
+                section_buttons = []
+                section_displays = []
+
+                section_colors = {
+                    '解剖学': '#ef4444',
+                    '生理学': '#22c55e',
+                    '药理学': '#3b82f6',
+                    '病理学': '#8b5cf6'
+                }
+
                 with gr.Row():
-                    kp_section = gr.Dropdown(sections, value="全部", label="章节")
-                    kp_topic = gr.Dropdown(["全部"], value="全部", label="考点")
+                    for section_name in sections:
+                        count = len(KP_BY_SECTION.get(section_name, []))
+                        color = section_colors.get(section_name, '#6b7280')
+                        btn = gr.Button(f"📖 {section_name} ({count}个)", size="lg", variant="secondary")
+                        section_buttons.append((section_name, btn))
 
-                kp_keyword = gr.Textbox(label="关键词搜索", placeholder="输入关键词...")
+                gr.Markdown("")
 
-                kp_search_btn = gr.Button("🔍 搜索", variant="primary")
+                # 显示区域
+                section_display = gr.HTML("")
 
-                # 知识点统计
-                kp_stats = gr.Markdown(f"**知识点总数**: {len(KB_DATA.get('knowledge_points', []))} 个")
+                # 为每个按钮创建点击事件
+                def make_show_func(section_name):
+                    def show_section():
+                        return display_section_knowledge_points(section_name)
+                    return show_section
 
-                kp_results = gr.Markdown("", elem_classes=["kp-scroll"])
-
-                # 章节变化时更新考点列表
-                kp_section.change(update_topic_dropdown, [kp_section], [kp_topic])
-
-                kp_search_btn.click(get_knowledge_points_grouped, [kp_section, kp_topic, kp_keyword], kp_results)
+                for section_name, btn in section_buttons:
+                    btn.click(make_show_func(section_name), None, section_display)
 
             # ====== 学习报告 Tab ======
             with gr.TabItem("📊 学习报告", id=3):
-                report_btn = gr.Button("🔄 刷新报告", variant="primary")
-                report_output = gr.Markdown("")
+                report_btn = gr.Button("🔄 刷新报告", variant="primary", size="lg")
+                report_output = gr.HTML("")
 
                 report_btn.click(get_report, None, report_output)
-
-    # 添加自定义 CSS
-    app.load(lambda: None)
 
     return app
 
 if __name__ == "__main__":
     app = create_app()
-    app.launch(server_name="127.0.0.1", server_port=7864, share=False, inbrowser=True)
+    app.launch(server_name="127.0.0.1", server_port=7866, share=False, inbrowser=True)
