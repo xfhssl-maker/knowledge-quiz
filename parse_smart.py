@@ -2,7 +2,8 @@
 """
 智能解析 PDF 文本
 合并相关内容行，生成更完整的知识点
-支持内容完整性检测，避免生成残缺题目
+支持内容完整性检测，过滤水印广告
+通用化：不限定任何学科领域
 """
 
 import json
@@ -10,6 +11,82 @@ import re
 from pathlib import Path
 from typing import List, Dict, Tuple
 from datetime import datetime
+from collections import Counter
+
+# 需要过滤的水印/广告关键词（通用）
+WATERMARK_PATTERNS = [
+    r'时政公考资料站',
+    r'公考资料站',
+    r'时政公考资',
+    r'时政公考',
+    r'时政公老',
+    r'时政公',
+    r'时政',
+    r'卡卡考公',
+    r'微信公众号',
+    r'放信公众号',
+    r'医疗考试',
+    r'\d+页\s*===',  # 页码标记
+    r'资料立',
+    r'资料站',
+    r'资料',
+    r'专士站',
+    r'公共',
+    r'公众号',
+]
+
+# 不应作为章节标题的短文本黑名单
+SECTION_BLACKLIST = {
+    '时政', '时政公考', '卡卡考公', '公考', '资料站', '资料立',
+    '医学基础必背考点',  # 文档标题不是章节
+    '微信公众号', '放信公众号', '资料', '公众号', '公共',
+}
+
+def is_watermark(line: str) -> bool:
+    """检查是否是水印/广告"""
+    for pattern in WATERMARK_PATTERNS:
+        if re.search(pattern, line):
+            return True
+    return False
+
+def clean_line(line: str) -> str:
+    """清理行内的水印内容"""
+    for pattern in WATERMARK_PATTERNS:
+        line = re.sub(pattern, '', line)
+    return line.strip()
+
+def is_section_title(line: str, all_lines: List[str] = None) -> bool:
+    """
+    判断是否为章节标题（保守策略，仅匹配明确的章节名称格式）：
+    - 以"学"/"论"/"法"/"理"/"史"等常见学科尾缀结尾，且长度2-6字
+    - 不在水印黑名单中
+    - 不包含数字或特殊字符
+    """
+    line = line.strip()
+    if not line or len(line) > 8:
+        return False
+
+    # 黑名单排除
+    if line in SECTION_BLACKLIST:
+        return False
+
+    # 必须是纯中文
+    if not re.match(r'^[\u4e00-\u9fa5]+$', line):
+        return False
+
+    # 太短的（1-2字）不算章节
+    if len(line) < 2:
+        return False
+
+    # 常见学科/章节标题尾缀（保守匹配）
+    section_suffixes = [
+        '学', '论', '法', '理', '史',
+    ]
+    for suffix in section_suffixes:
+        if line.endswith(suffix) and len(line) >= 2:
+            return True
+
+    return False
 
 def smart_parse(text_file: str) -> Tuple[List[Dict], List[str], List[str]]:
     """智能解析 PDF 文本"""
@@ -41,16 +118,34 @@ def smart_parse(text_file: str) -> Tuple[List[Dict], List[str], List[str]]:
             pending_lines = []
             return
 
+        # 过滤纯数字、页码等无效内容
+        if re.match(r'^[\d\s\-=]+$', full_content):
+            pending_lines = []
+            return
+
         # 提取标题（第一行的前部分）
         first_line = pending_lines[0]
 
         # 尝试提取标题
-        title = first_line[:50]
+        title = first_line[:80]
         for sep in ['——', '－', '：', ':', '-']:
             if sep in first_line:
                 parts = first_line.split(sep, 1)
                 title = parts[0].strip()
+                if len(title) < 3:
+                    title = first_line[:50]
                 break
+
+        # 清理标题
+        title = clean_line(title)
+        if len(title) < 3:
+            pending_lines = []
+            return
+
+        # 检查标题是否是有效知识点（不是目录项）
+        if re.match(r'^\d+\s*$', title):  # 纯数字
+            pending_lines = []
+            return
 
         kp = {
             "id": f"kp-{kp_id:03d}",
@@ -87,10 +182,21 @@ def smart_parse(text_file: str) -> Tuple[List[Dict], List[str], List[str]]:
             if line.startswith('=== 第'):
                 continue
 
-            # 检测章节标题
-            if line in ['解剖学', '生理学', '药理学', '病理学']:
+            # 过滤水印/广告
+            if is_watermark(line):
+                continue
+
+            # 清理行内水印
+            line = clean_line(line)
+            if not line or len(line) < 3:
+                continue
+
+            # 检测章节标题（通用启发式）
+            if is_section_title(line):
                 flush_pending()
-                current_section = line
+                # 归一化：去掉 OCR 误加的尾缀 "一"、"，" 等
+                normalized = re.sub(r'[一，,]$', '', line)
+                current_section = normalized
                 if current_section not in sections:
                     sections.append(current_section)
                 continue
@@ -133,32 +239,39 @@ def smart_parse(text_file: str) -> Tuple[List[Dict], List[str], List[str]]:
     return knowledge_points, sections, list(topics)
 
 def extract_keywords(text: str) -> List[str]:
-    """提取关键词"""
-    medical_terms = [
-        '细胞', '组织', '器官', '系统', '神经', '血管', '骨骼', '肌肉',
-        '心脏', '肝脏', '肾脏', '肺', '胃', '肠', '血液', '淋巴',
-        '激素', '酶', '蛋白', '糖', '脂肪', '代谢', '免疫',
-        '炎症', '肿瘤', '感染', '药物', '治疗', '诊断',
-        '解剖', '生理', '病理', '药理', '临床', '症状',
-        '受体', '递质', '离子', '电位', '渗透压', '血压',
-        '呼吸', '循环', '消化', '排泄', '内分泌', '生殖',
-        '脊髓', '脑', '反射', '传导', '收缩', '舒张',
-        '滤过', '重吸收', '分泌', '合成', '分解',
-        '抗生素', '抗菌', '消炎', '镇痛', '镇静', '催眠',
-        '毒性', '副作用', '禁忌', '剂量', '浓度',
-        '心电图', '体温', '脉搏', '呼吸频率',
-        '白细胞', '红细胞', '血小板', '血红蛋白',
-        '葡萄糖', '胰岛素', '甲状腺', '肾上腺',
-        '青霉素', '头孢', '阿司匹林', '吗啡', '地高辛',
-        '静脉', '动脉', '毛细血管', '心房', '心室'
+    """提取关键词（通用方法，不限定领域）"""
+    # 通用模式：从文本结构中提取术语
+    patterns = [
+        r'[\u4e00-\u9fa5]{2,6}(?=：|:)',          # 冒号前的术语
+        r'[\u4e00-\u9fa5]{2,4}(?=\(|（)',          # 括号前的术语
+        r'[A-Z][a-zA-Z]+(?=\s|$)',                  # 英文术语
+        r'[\u4e00-\u9fa5]{2,4}(?=的|是|为|有)',     # 谓语前的名词
     ]
 
     keywords = []
-    for term in medical_terms:
-        if term in text and term not in keywords:
-            keywords.append(term)
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        keywords.extend(matches[:3])
 
-    return keywords[:6]
+    # 通用 fallback：提取高频 2-4 字中文词组
+    chinese_words = re.findall(r'[\u4e00-\u9fa5]{2,4}', text)
+    word_freq = Counter(chinese_words)
+    stopwords = {'的是', '了一', '在一', '和一', '以一', '上一', '下一', '中一',
+                 '这是', '那个', '这个', '什么', '怎么', '如果', '因为', '所以',
+                 '但是', '而且', '或者', '以及', '不是', '没有', '可以', '需要'}
+    for word, _ in word_freq.most_common(10):
+        if word not in stopwords and word not in keywords and len(word) >= 2:
+            keywords.append(word)
+
+    # 去重
+    seen = set()
+    unique = []
+    for kw in keywords:
+        if kw not in seen and len(kw) >= 2:
+            seen.add(kw)
+            unique.append(kw)
+
+    return unique[:6]
 
 def is_content_complete(content: str) -> bool:
     """检查内容是否完整"""
@@ -182,109 +295,105 @@ def is_content_complete(content: str) -> bool:
     return True
 
 def generate_questions(kp: Dict, q_id: int) -> Tuple[List, int]:
-    """生成题目"""
-    questions = []
-    content = kp['content']
-    title = kp['title']
+    """生成选择题 - 委托给 QuestionGenerator"""
+    # 延迟导入避免循环依赖
+    from question_generator import QuestionGenerator
+
+    # 单个知识点无法做交叉干扰，用简化版
+    content = kp.get('content', '')
+    title = kp.get('title', '')
     section = kp.get('section', '')
     topic = kp.get('topic', '')
 
-    # 检查内容是否完整
-    content_complete = is_content_complete(content)
+    if len(content) < 10:
+        return [], q_id
 
-    # 提取数字（带单位）
-    numbers = re.findall(r'(\d+(?:\.\d+)?)\s*(cm|ml|min|m|mg|mmHg|%|天|小时|次|个|岁|cm²|ml/min)', content)
+    questions = []
 
-    # 生成选择题
-    if numbers and content_complete:
-        # 有明确数值且内容完整，生成数值选择题
+    # 数值型
+    numbers = re.findall(r'(\d+(?:\.\d+)?)\s*(cm|ml|min|m|mg|mmHg|%|天|小时|次|个|岁|层|种|块)', content)
+    if numbers:
         num_value, unit = numbers[0]
-        q_text = f"【{section}】关于「{title}」，正确的数值是？"
-        correct = f"{num_value}{unit}"
-
         try:
             num = float(num_value)
-            if '.' in num_value:
-                wrong1 = f"{num * 1.2:.1f}{unit}"
-                wrong2 = f"{num * 0.8:.1f}{unit}"
-                wrong3 = f"{num * 1.5:.1f}{unit}"
+            correct_opt = f"{num_value}{unit}"
+            wrong_values = set()
+            if num == int(num):
+                offsets = [-2, -1, 1, 2, 3, -3, 5]
+                random.shuffle(offsets)
+                for off in offsets:
+                    w = int(num + off)
+                    if w > 0 and w != int(num):
+                        wrong_values.add(w)
+                    if len(wrong_values) >= 3:
+                        break
             else:
-                wrong1 = f"{int(num * 1.2)}{unit}"
-                wrong2 = f"{int(num * 0.8)}{unit}"
-                wrong3 = f"{int(num * 1.5)}{unit}"
-        except:
-            wrong1, wrong2, wrong3 = "10" + unit, "20" + unit, "30" + unit
+                for f in [0.8, 1.2, 1.5, 0.5]:
+                    w = round(num * f, 1)
+                    if w > 0 and w != num:
+                        wrong_values.add(w)
+                    if len(wrong_values) >= 3:
+                        break
+            wrong_list = list(wrong_values)[:3]
+            wrong_opts = [f"{w}{unit}" for w in wrong_list]
 
-        options = [f"A. {correct}", f"B. {wrong1}", f"C. {wrong2}", f"D. {wrong3}"]
-        answer = "A"
+            all_opts = [correct_opt] + wrong_opts
+            random.shuffle(all_opts)
+            idx = all_opts.index(correct_opt)
+            answer = chr(65 + idx)
+            options = [f"{chr(65+i)}. {v}" for i, v in enumerate(all_opts)]
 
-    elif content_complete and len(content) > 30:
-        # 内容完整，生成判断型选择题
-        # 截取合理长度
-        display_content = content[:120] + "..." if len(content) > 120 else content
-        q_text = f"【{section}】关于「{title}」，以下说法正确的是？"
-        options = [
-            f"A. {display_content}",
-            "B. 该说法不正确",
-            "C. 该说法部分正确",
-            "D. 以上都不对"
-        ]
-        answer = "A"
+            q_text = f"【{section}】{title}约为多少？"
+            questions.append({
+                "id": f"q-{q_id:03d}", "type": "choice", "subtype": "numeric",
+                "section": section, "topic": topic, "knowledge_point_id": kp['id'],
+                "question": q_text, "options": options, "answer": answer,
+                "explanation": content, "difficulty": kp.get('difficulty', 2)
+            })
+            return questions, q_id + 1
+        except (ValueError, IndexError):
+            pass
+
+    # 通用型：用交叉干扰（从同章节取）
+    # 简化版：标题 + 截取内容作为干扰
+    correct_desc = content[:150] if len(content) <= 150 else content[:150] + "..."
+
+    # 尝试术语定义格式
+    sep_match = re.search(r'[：:——]', content)
+    if sep_match:
+        pos = sep_match.start()
+        term = content[:pos].strip()
+        definition = content[pos+1:].lstrip('：:——').strip()
+        if len(term) >= 2 and len(definition) >= 8:
+            q_text = f"【{section}】{term}是指什么？"
+            correct_desc = definition[:150] if len(definition) <= 150 else definition[:150] + "..."
+        else:
+            q_text = f"【{section}】关于「{title}」，以下哪项描述正确？"
     else:
-        # 内容不完整，只生成判断题，不生成选择题
-        # 生成判断题
-        judgment_text = f"【{section}】{title}"
-        if len(judgment_text) > 150:
-            judgment_text = judgment_text[:150] + "..."
+        q_text = f"【{section}】关于「{title}」，以下哪项描述正确？"
 
-        questions.append({
-            "id": f"q-{q_id:03d}",
-            "type": "judgment",
-            "section": section,
-            "topic": topic,
-            "knowledge_point_id": kp['id'],
-            "question": judgment_text,
-            "answer": True,
-            "explanation": f"该知识点来自{section}" + (f"的{topic}" if topic else "") + f"。{content}",
-            "difficulty": kp.get('difficulty', 2)
-        })
-        return questions, q_id + 1
+    # 简化干扰项（无法交叉时用改写）
+    distractors = [
+        title + "的说法有误",
+        "以上描述均不准确",
+        "该描述需要补充前提条件",
+    ]
+    all_opts = [correct_desc] + distractors
+    random.shuffle(all_opts)
+    idx = all_opts.index(correct_desc)
+    answer = chr(65 + idx)
+    options = [f"{chr(65+i)}. {v}" for i, v in enumerate(all_opts)]
 
     questions.append({
-        "id": f"q-{q_id:03d}",
-        "type": "choice",
-        "section": section,
-        "topic": topic,
-        "knowledge_point_id": kp['id'],
-        "question": q_text,
-        "options": options,
-        "answer": answer,
-        "explanation": content,
-        "difficulty": kp.get('difficulty', 2)
-    })
-    q_id += 1
-
-    # 生成判断题
-    judgment_text = f"【{section}】{title}：{content}"
-    if len(judgment_text) > 180:
-        judgment_text = judgment_text[:180] + "..."
-
-    questions.append({
-        "id": f"q-{q_id:03d}",
-        "type": "judgment",
-        "section": section,
-        "topic": topic,
-        "knowledge_point_id": kp['id'],
-        "question": judgment_text,
-        "answer": True,
-        "explanation": f"该知识点来自{section}" + (f"的{topic}" if topic else ""),
-        "difficulty": kp.get('difficulty', 2)
+        "id": f"q-{q_id:03d}", "type": "choice", "subtype": "compare",
+        "section": section, "topic": topic, "knowledge_point_id": kp['id'],
+        "question": q_text, "options": options, "answer": answer,
+        "explanation": content, "difficulty": kp.get('difficulty', 2)
     })
 
     return questions, q_id + 1
 
 def main():
-    """主函数示例"""
     print("=" * 60)
     print("智能 PDF 知识点解析")
     print("=" * 60)
@@ -320,7 +429,6 @@ def main():
 
     # 统计
     choice_count = len([q for q in questions if q['type'] == 'choice'])
-    judgment_count = len([q for q in questions if q['type'] == 'judgment'])
 
     section_stats = {}
     for kp in valid_points:
@@ -333,12 +441,12 @@ def main():
 
     print(f"\n题型分布:")
     print(f"  选择题: {choice_count}")
-    print(f"  判断题: {judgment_count}")
 
     # 保存知识点
+    source_name = input_path.stem
     kb_data = {
-        "name": "医学基础必背考点",
-        "source": "医学类-医学基础必背考点.pdf",
+        "name": source_name,
+        "source": input_path.name,
         "sections": sections,
         "topics": topics,
         "knowledge_points": valid_points,
@@ -359,6 +467,15 @@ def main():
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(questions, f, ensure_ascii=False, indent=2)
     print(f"题目已保存: {output_path}")
+
+    # 显示示例
+    print("\n" + "=" * 60)
+    print("示例知识点:")
+    for kp in valid_points[:3]:
+        print(f"\n[{kp['section']}] {kp['topic']}")
+        print(f"标题: {kp['title']}")
+        print(f"内容: {kp['content'][:100]}...")
+        print(f"完整度: {'完整' if is_content_complete(kp['content']) else '不完整'}")
 
 if __name__ == "__main__":
     main()
